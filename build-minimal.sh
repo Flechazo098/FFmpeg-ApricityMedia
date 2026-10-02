@@ -336,7 +336,7 @@ build_jni() {
             lib_ext="dll"
             jni_os="win32"
             jni_basename="apricitymedia-jni"
-            extra_libs="-Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lole32 -lpsapi -lbcrypt -ldxguid -lz -static-libgcc -static-libstdc++"
+            extra_libs="-Wl,-Bstatic -lwinpthread -lz -Wl,-Bdynamic -lole32 -lpsapi -lbcrypt -ldxguid -static-libgcc -static-libstdc++"
             extra_ldflags="-Wl,--enable-runtime-pseudo-reloc"
             ;;
         linux)
@@ -424,6 +424,7 @@ build_ffmapi() {
                 -I"$ffinc" -L"$fflib" \
                 "$src" \
                 -lavformat -lavcodec -lavutil -lswresample -lswscale \
+                -ldxguid -Wl,-Bstatic -lz -Wl,-Bdynamic \
                 -lm -O2 -s -static-libgcc -static-libstdc++
             ;;
         linux*)
@@ -432,7 +433,7 @@ build_ffmapi() {
                 -I"$ffinc" -L"$fflib" \
                 "$src" \
                 -lavformat -lavcodec -lavutil -lswresample -lswscale \
-                -lm -O2 -s
+                -lz -lm -O2 -s
             ;;
         macos*)
             out="$out.dylib"
@@ -440,7 +441,7 @@ build_ffmapi() {
                 -I"$ffinc" -L"$fflib" \
                 "$src" \
                 -lavformat -lavcodec -lavutil -lswresample -lswscale \
-                -lm -O2 -framework CoreVideo -framework CoreMedia
+                -lz -lm -O2 -framework CoreVideo -framework CoreMedia
             ;;
         android*)
             out="$out.so"
@@ -450,7 +451,7 @@ build_ffmapi() {
                     -I"$ffinc" -L"$fflib" \
                     "$src" \
                     -lavformat -lavcodec -lavutil -lswresample -lswscale \
-                    -lm -O2 -s
+                    -lz -lm -O2 -s
             else
                 echo "ANDROID_NDK_HOME not set" >&2
                 exit 1
