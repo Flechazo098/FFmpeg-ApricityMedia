@@ -336,7 +336,7 @@ build_jni() {
             lib_ext="dll"
             jni_os="win32"
             jni_basename="apricitymedia-jni"
-            extra_libs="-Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lole32 -lpsapi -lbcrypt -static-libgcc -static-libstdc++"
+            extra_libs="-Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -lole32 -lpsapi -lbcrypt -ldxguid -lz -static-libgcc -static-libstdc++"
             extra_ldflags="-Wl,--enable-runtime-pseudo-reloc"
             ;;
         linux)
@@ -344,7 +344,7 @@ build_jni() {
             lib_ext="so"
             jni_os="linux"
             jni_basename="libapricitymedia-jni"
-            extra_libs="-lpthread -ldl"
+            extra_libs="-lpthread -ldl -lz"
             extra_ldflags=""
             ;;
         macos)
@@ -352,7 +352,7 @@ build_jni() {
             lib_ext="dylib"
             jni_os="darwin"
             jni_basename="libapricitymedia-jni"
-            extra_libs=""
+            extra_libs="-lz"
             extra_ldflags=""
             ;;
         android)
@@ -361,7 +361,7 @@ build_jni() {
             lib_ext="so"
             jni_os="linux"
             jni_basename="libapricitymedia-jni"
-            extra_libs="-llog"
+            extra_libs="-llog -lz"
             extra_ldflags=""
             ;;
     esac
@@ -393,6 +393,7 @@ build_jni() {
         -I"$ffinc" \
         -L"$fflib" \
         "$JNI_DIR/jni_ffmpeg.c" \
+        "$JNI_DIR/am_ffmpeg.c" \
         -lavformat -lavcodec -lavutil -lswresample -lswscale \
         $extra_libs -lm -O2 -s $extra_ldflags
 
