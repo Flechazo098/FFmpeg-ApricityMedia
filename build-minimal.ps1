@@ -5,7 +5,7 @@
 #
 # Prerequisites (MSYS2 MINGW64):
 #   pacman -S make mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm `
-#             mingw-w64-x86_64-pkg-config diffutils
+#             mingw-w64-x86_64-pkg-config mingw-w64-x86_64-zlib diffutils
 #
 # Usage:
 #   .\build-minimal.ps1 configure          # Step 1
@@ -196,6 +196,23 @@ function Invoke-Msys2Script($body) {
     }
 }
 
+function Install-WindowsRuntimeClosure {
+    $binDir = Convert-ToMsysPath (Join-Path $BuildDir "dist/bin")
+    $script = @"
+set -e &&
+avutil='$binDir/avutil-60.dll' &&
+pthread='/mingw64/bin/libwinpthread-1.dll' &&
+test -f "`$avutil" &&
+test -f "`$pthread" &&
+cp -f "`$pthread" '$binDir/apwinpthread_01.dll' &&
+cp -f /mingw64/bin/libdav1d-*.dll '$binDir/' &&
+perl -0777 -i -pe 's/libwinpthread-1\.dll/apwinpthread_01.dll/g' "`$avutil" &&
+objdump -p "`$avutil" | grep -q 'DLL Name: apwinpthread_01.dll'
+"@
+    Invoke-Msys2Script $script
+    Write-Host "Windows runtime closure installed and avutil import isolated." -ForegroundColor Green
+}
+
 # ================================================================
 # Commands
 # ================================================================
@@ -245,6 +262,7 @@ function Invoke-BuildFfmpeg {
     # package so the `make` command is available.
     $script = "cd '$build' && command -v make >/dev/null 2>&1 || { echo 'make not found (MSYS2). Install: pacman -S make' >&2; exit 127; } && make -j$jobs && make install"
     Invoke-Msys2Script $script
+    Install-WindowsRuntimeClosure
 
     $libDir = Join-Path $BuildDir "dist/lib"
     Write-Host "`nBuild complete. Libraries in: $libDir" -ForegroundColor Green
@@ -276,11 +294,13 @@ function Invoke-BuildJni {
     $jniMd = 'win32'
     $outMsys = Convert-ToMsysPath (Join-Path $BuildDir "dist/bin/apricitymedia-jni.dll")
     $srcMsys = Convert-ToMsysPath (Join-Path $JniDir "jni_ffmpeg.c")
+    $apiSrcMsys = Convert-ToMsysPath (Join-Path $JniDir "am_ffmpeg.c")
+    $jniDirMsys = Convert-ToMsysPath $JniDir
 
     Write-Host "  Output:   $(Join-Path $BuildDir 'dist/bin/apricitymedia-jni.dll')" -ForegroundColor Gray
 
     # Build inside MSYS2 so gcc and linker have the MSYS2 runtime
-    $script = "gcc -shared -o '$outMsys' -I'$javaincMsys' -I'$javaincMsys/$jniMd' -I'$ffincMsys' -L'$fflibMsys' '$srcMsys' -lavformat -lavcodec -lavutil -lswresample -lswscale -lm -O2 -s -Wl,--enable-runtime-pseudo-reloc -static-libgcc -static-libstdc++"
+    $script = "gcc -shared -o '$outMsys' -I'$javaincMsys' -I'$javaincMsys/$jniMd' -I'$jniDirMsys' -I'$ffincMsys' -L'$fflibMsys' '$srcMsys' '$apiSrcMsys' -lavformat -lavcodec -lavutil -lswresample -lswscale -ldxguid -lm -Wl,-Bstatic -lz -Wl,-Bdynamic -O2 -s -Wl,--enable-runtime-pseudo-reloc -static-libgcc -static-libstdc++"
     Invoke-Msys2Script $script
 
     $outPath = Join-Path $BuildDir "dist/bin/apricitymedia-jni.dll"
@@ -329,8 +349,44 @@ function Invoke-All {
     Invoke-Configure
     Invoke-BuildFfmpeg
     Invoke-BuildJni
+    Invoke-BuildFfmapi
     Write-Host "`n=== All done ===" -ForegroundColor Cyan
     Write-Host "Output: $(Join-Path $BuildDir 'dist/bin/')" -ForegroundColor Green
+    Write-Host "This command builds Windows x64 only. Run validate-runtime-zips <zip-directory> to validate a cross-platform distribution." -ForegroundColor Yellow
+}
+
+function Assert-RuntimeZips([string]$ZipDirectory) {
+    if (-not $ZipDirectory -or -not (Test-Path -LiteralPath $ZipDirectory -PathType Container)) {
+        throw "Provide a directory containing ffmpeg-ffmapi-mc-26.1-<platform>.zip. Windows all does not build Linux, Android or macOS."
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $runtimeNames = @{
+        'windows-x64' = 'am_ffmpeg.dll'
+        'linux-x64' = 'libam_ffmpeg.so'
+        'android-arm64' = 'libam_ffmpeg.so'
+        'macos-arm64' = 'am_ffmpeg.dylib'
+    }
+    $failures = [System.Collections.Generic.List[string]]::new()
+    foreach ($platform in $runtimeNames.Keys) {
+        $zipPath = Join-Path $ZipDirectory "ffmpeg-ffmapi-mc-26.1-$platform.zip"
+        if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+            $failures.Add("Missing archive: $zipPath")
+            continue
+        }
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+        try {
+            $entry = $archive.GetEntry($runtimeNames[$platform])
+            if (-not $entry -or $entry.Length -eq 0) {
+                $failures.Add("$platform archive is missing the FFM bridge $($runtimeNames[$platform]). Build that target with its native toolchain before distribution.")
+            }
+        } finally {
+            $archive.Dispose()
+        }
+    }
+    if ($failures.Count -gt 0) {
+        throw ("Cross-platform runtime validation failed:`n" + ($failures -join "`n"))
+    }
+    Write-Host "All four platform archives contain their FFM bridge." -ForegroundColor Green
 }
 
 function Invoke-BuildFfmapi {
@@ -355,7 +411,7 @@ function Invoke-BuildFfmapi {
 
     # Plain C shared library — no JNI headers, no JAVA_HOME dependency.
     # Callable from Java FFM API via Linker.downcallHandle() or jextract bindings.
-    $script = "gcc -shared -o '$outMsys' -I'$ffincMsys' -L'$fflibMsys' '$srcMsys' -lavformat -lavcodec -lavutil -lswresample -lswscale -lm -O2 -s -Wl,--enable-runtime-pseudo-reloc -static-libgcc -static-libstdc++"
+    $script = "gcc -shared -o '$outMsys' -I'$ffincMsys' -L'$fflibMsys' '$srcMsys' -lavformat -lavcodec -lavutil -lswresample -lswscale -ldxguid -lm -Wl,-Bstatic -lz -Wl,-Bdynamic -O2 -s -Wl,--enable-runtime-pseudo-reloc -static-libgcc -static-libstdc++"
     Invoke-Msys2Script $script
 
     $outPath = Join-Path $BuildDir "dist/bin/am_ffmpeg.dll"
@@ -381,8 +437,9 @@ switch ($command) {
     'build-ffmapi'   { Invoke-BuildFfmapi }
     'gen-header'     { Invoke-GenHeader }
     'all'            { Invoke-All }
+    'validate-runtime-zips' { Assert-RuntimeZips $(if ($args.Count -gt 1) { $args[1] } else { '' }) }
     default {
-        Write-Host "Usage: $($MyInvocation.MyCommand.Name) [configure|build-ffmpeg|build-jni|build-ffmapi|gen-header|all]" -ForegroundColor Yellow
+        Write-Host "Usage: $($MyInvocation.MyCommand.Name) [configure|build-ffmpeg|build-jni|build-ffmapi|gen-header|all|validate-runtime-zips <zip-directory>]" -ForegroundColor Yellow
         exit 1
     }
 }

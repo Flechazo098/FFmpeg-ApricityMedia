@@ -50,6 +50,24 @@ extern "C" {
 AM_API void am_init(void);
 AM_API const char *am_last_error(void);
 
+/* Callbacks remain alive until decoder close returns. Each decoder has an
+ * independent seekable input cursor. Release is called exactly once, including
+ * open failure, after FFmpeg has stopped reading. It may be NULL for FFM. */
+typedef int (*am_io_read_callback)(void *opaque, uint8_t *buffer, int length);
+typedef int64_t (*am_io_seek_callback)(void *opaque, int64_t offset, int whence);
+typedef void (*am_io_release_callback)(void *opaque);
+
+/* Native archive ranges. Methods 0 and 8 are ZIP STORED and raw DEFLATE.
+ * The decoder owns its file cursor. Compressed cursors share bounded inflate
+ * checkpoints while alive. Archive/name strings are borrowed only during open. */
+AM_API uint64_t am_video_open_region(const char *name, int target_width, int target_height,
+        double max_fps, int timeout, int buffer, int reconnect, int hardware, int nvdec,
+        const char *preferred, const char *archive, int64_t offset, int64_t compressed_length,
+        int64_t length, int compression);
+AM_API uint64_t am_audio_open_region(const char *name, int timeout, int buffer, int reconnect,
+        const char *archive, int64_t offset, int64_t compressed_length, int64_t length, int compression);
+AM_API int64_t am_resource_io_metric(int metric);
+
 /* ---------------------------------------------------------------
  *  Video
  * --------------------------------------------------------------- */
@@ -65,7 +83,25 @@ AM_API uint64_t am_video_open(const char *path,
                               int hw_nvdec_enabled,
                               const char *hw_preferred);
 
+AM_API uint64_t am_video_open_io(const char *name, int target_width, int target_height,
+                                double max_fps, int network_timeout_ms, int network_buffer_kb,
+                                int network_reconnect, int hw_decode_enabled, int hw_nvdec_enabled,
+                                const char *hw_preferred, void *opaque, am_io_read_callback read,
+                                am_io_seek_callback seek, am_io_release_callback release);
+
 AM_API uint64_t am_video_read_frame(uint64_t decoder);
+/* Bounded, independent source lease. Release through am_video_frame_release. */
+AM_API uint64_t am_video_frame_retain_source(uint64_t frame);
+/* Decoder-worker only. Never modifies a currently leased presentation texture. */
+AM_API uint64_t am_video_frame_create_presentation(uint64_t source, int width, int height, uint64_t generation);
+/* generation, original visible width, original visible height */
+AM_API int am_video_frame_get_presentation_info(uint64_t frame, int64_t out[3]);
+
+/* Sets the post-decode GPU presentation bounding box in physical pixels. */
+AM_API int am_video_set_presentation_size(uint64_t decoder,
+                                          int physical_width,
+                                          int physical_height,
+                                          uint64_t demand_generation);
 
 AM_API int  am_video_frame_get_info(uint64_t frame, int64_t out[4]);
 AM_API void *am_video_frame_get_pixels(uint64_t frame);
@@ -102,6 +138,11 @@ AM_API uint64_t am_audio_open(const char *path,
                               int network_timeout_ms,
                               int network_buffer_kb,
                               int network_reconnect);
+
+AM_API uint64_t am_audio_open_io(const char *name, int network_timeout_ms,
+                                int network_buffer_kb, int network_reconnect,
+                                void *opaque, am_io_read_callback read,
+                                am_io_seek_callback seek, am_io_release_callback release);
 
 AM_API int  am_audio_read_pcm(uint64_t decoder,
                               uint8_t *buffer, int offset, int length);

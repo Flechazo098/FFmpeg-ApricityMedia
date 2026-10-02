@@ -12,9 +12,10 @@
  *   - Proper send/receive retry loops with EAGAIN handling
  */
 
-#include "am_ffmpeg.h"
 #define AM_BUILD_DLL
+#include "am_ffmpeg.h"
 #include <stdint.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
@@ -32,6 +33,7 @@
 #include <libavutil/hwcontext.h>
 #if defined(_WIN32)
 #include <libavutil/hwcontext_d3d11va.h>
+#include <d3d11_1.h>
 #endif
 #include <libavutil/imgutils.h>
 #include <libavutil/log.h>
@@ -42,6 +44,8 @@
 #include <libavutil/time.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
+#include "am_custom_io.h"
+#include "am_archive_io.h"
 
 /* ================================================================
  *  Constants
@@ -50,7 +54,7 @@
 #define AUDIO_OUT_SAMPLE_RATE  48000
 #define AUDIO_OUT_SAMPLE_FMT   AV_SAMPLE_FMT_S16
 #define AUDIO_OUT_CHANNELS     2
-#define VIDEO_FRAME_POOL_SIZE  8
+#define VIDEO_FRAME_POOL_SIZE  10 /* queue, renderer, source lease and replacement output */
 
 #define AP_FRAME_FMT_RGBA8888  0
 #define AP_FRAME_FMT_YUV420P   1
@@ -68,7 +72,11 @@ static int is_remote(const char *path) {
     return strstr(path, "://") != NULL;
 }
 
-static char g_last_error[1024] = "";
+#if defined(_MSC_VER)
+static __declspec(thread) char g_last_error[1024] = "";
+#else
+static _Thread_local char g_last_error[1024] = "";
+#endif
 
 /* Lightweight spin lock for JNI-side shared state (decoder registry / frame pool). */
 static void spin_lock(volatile int *lock_var) {
@@ -122,8 +130,10 @@ static void set_network_opts(AVDictionary **opts,
 }
 
 static int open_input(AVFormatContext **fmt_ctx, const char *path,
-                       int timeout_ms, int buf_kb, int reconnect)
+                       int timeout_ms, int buf_kb, int reconnect, AmCustomInput *input)
 {
+    int prepared = am_custom_prepare(input, *fmt_ctx);
+    if (prepared < 0) return prepared;
     AVDictionary *opts = NULL;
     if (is_remote(path))
         set_network_opts(&opts, timeout_ms, buf_kb, reconnect);
@@ -175,6 +185,28 @@ static int64_t resolve_pts(const AVFrame *f, AVRational tb, int64_t *fb) {
 static int resolve_dur(const AVFrame *f, AVRational tb, int def) {
     if (f->duration > 0) return (int)fmax(1, round(f->duration * rat_dbl(tb) * 1000.0));
     return def;
+}
+
+/* A seek to the exact container duration is a valid UI position but no frame
+   can start there. Clamp it to the final representable millisecond so video
+   preroll and audio trimming share one effective target instead of reaching
+   EOF with an apparently accepted seek. */
+static int64_t clamp_seek_target_ms(const AVFormatContext *format, int stream_index, int64_t target_ms) {
+    if (target_ms < 0) target_ms = 0;
+    if (!format) return target_ms;
+    int64_t duration_ms = -1;
+    if (stream_index >= 0 && stream_index < (int)format->nb_streams) {
+        AVStream *stream = format->streams[stream_index];
+        if (stream && stream->duration > 0 && stream->duration != AV_NOPTS_VALUE
+                && stream->time_base.num > 0 && stream->time_base.den > 0) {
+            duration_ms = av_rescale_q(stream->duration, stream->time_base, (AVRational){1, 1000});
+        }
+    }
+    if (duration_ms <= 0 && format->duration > 0 && format->duration != AV_NOPTS_VALUE) {
+        duration_ms = format->duration / 1000;
+    }
+    if (duration_ms > 0 && target_ms >= duration_ms) return duration_ms - 1;
+    return target_ms;
 }
 
 static enum AVPixelFormat choose_software_pix_fmt(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
@@ -266,6 +298,7 @@ typedef struct {
     ID3D11VideoProcessorOutputView *gpu_interop_output_view;
 #endif
     AVFrame *gpu_frame_ref;   /* hold HW surface lifetime for zero-copy interop */
+    uint64_t presentation_generation;
     int      width;
     int      height;
     int64_t  pts_ms;
@@ -275,6 +308,7 @@ typedef struct {
 
 typedef struct {
     AVFormatContext  *fmt_ctx;
+    AmCustomInput     input;
     AVCodecContext   *codec_ctx;
     int               stream_index;
     AVRational        time_base;
@@ -308,13 +342,22 @@ typedef struct {
 #if defined(_WIN32)
     ID3D11VideoDevice *d3d11_video_device;
     ID3D11VideoContext *d3d11_video_context;
+    ID3D11VideoContext1 *d3d11_video_context1;
     ID3D11VideoProcessorEnumerator *d3d11_vp_enum;
+    ID3D11VideoProcessorEnumerator1 *d3d11_vp_enum1;
     ID3D11VideoProcessor *d3d11_vp;
     UINT              d3d11_vp_in_w;
     UINT              d3d11_vp_in_h;
+    UINT              d3d11_vp_out_w;
+    UINT              d3d11_vp_out_h;
     DXGI_FORMAT       d3d11_vp_in_fmt;
     int               d3d11_vp_colorspace_logged;
 #endif
+
+    volatile int      presentation_lock;
+    int               presentation_width;
+    int               presentation_height;
+    uint64_t          presentation_generation;
 
     /* Frame pool — sws_scale writes directly into pooled buffers */
     int               pool_size;
@@ -329,6 +372,7 @@ typedef struct {
     int               eof;
     int64_t           fallback_pts_ms;
     int64_t           last_emitted_pts_ms;
+    int64_t           seek_preroll_target_ms;
 } VideoDecoder;
 
 #if defined(_WIN32)
@@ -735,13 +779,16 @@ static VideoDecoder *g_active_decoders[MAX_ACTIVE_DECODERS];
 static int g_active_decoder_count = 0;
 static volatile int g_decoder_registry_lock = 0;
 
-static void decoder_registry_add(VideoDecoder *d) {
-    if (!d) return;
+static int decoder_registry_add(VideoDecoder *d) {
+    int added = 0;
+    if (!d) return 0;
     spin_lock(&g_decoder_registry_lock);
     if (g_active_decoder_count < MAX_ACTIVE_DECODERS) {
         g_active_decoders[g_active_decoder_count++] = d;
+        added = 1;
     }
     spin_unlock(&g_decoder_registry_lock);
+    return added;
 }
 
 static int decoder_registry_remove(VideoDecoder *d) {
@@ -804,6 +851,17 @@ static int pool_pop(VideoDecoder *d) {
     }
     spin_unlock(&d->pool_lock);
     return idx;
+}
+
+/* Decoder output must not be consumed unless a Java-owned frame slot exists.
+ * pool_pop has a single producer (the decoder thread), while releases may run
+ * concurrently, so this preflight cannot race with another pop. */
+static int pool_has_free(VideoDecoder *d) {
+    if (!d || !d->free_stack || !d->in_use) return 0;
+    spin_lock(&d->pool_lock);
+    int available = d->free_count > 0;
+    spin_unlock(&d->pool_lock);
+    return available;
 }
 
 static void pool_push(VideoDecoder *d, int idx) {
@@ -881,8 +939,7 @@ static int pool_init(VideoDecoder *d, int count, int w, int h) {
 }
 
 static void pool_free(VideoDecoder *d) {
-    if (!d->pool) return;
-    for (int i = 0; i < d->pool_size; i++) {
+    for (int i = 0; d->pool && i < d->pool_size; i++) {
         if (d->pool[i].rgba_data) av_free(d->pool[i].rgba_data);
         if (d->pool[i].gpu_frame_ref) av_frame_free(&d->pool[i].gpu_frame_ref);
 #if defined(_WIN32)
@@ -958,6 +1015,7 @@ static void vd_free(VideoDecoder *d) {
     if (d->hw_device_ctx)  av_buffer_unref(&d->hw_device_ctx);
     if (d->codec_ctx)     avcodec_free_context(&d->codec_ctx);
     if (d->fmt_ctx)       avformat_close_input(&d->fmt_ctx);
+    am_custom_close(&d->input);
     if (d->sws_ctx)       sws_freeContext(d->sws_ctx);
     if (d->decoded_frame) av_frame_free(&d->decoded_frame);
     if (d->pkt)           av_packet_free(&d->pkt);
@@ -973,7 +1031,7 @@ static int vd_open(VideoDecoder *d, const char *path,
     d->fmt_ctx = avformat_alloc_context();
     if (!d->fmt_ctx) return AVERROR(ENOMEM);
 
-    int ret = open_input(&d->fmt_ctx, path, tmo, buf_kb, recon);
+    int ret = open_input(&d->fmt_ctx, path, tmo, buf_kb, recon, &d->input);
     if (ret < 0) return ret;
 
     ret = avformat_find_stream_info(d->fmt_ctx, NULL);
@@ -1054,6 +1112,7 @@ static int vd_open(VideoDecoder *d, const char *path,
     if (ret < 0) return ret;
 
     d->last_emitted_pts_ms = INT64_MIN;
+    d->seek_preroll_target_ms = -1;
     return 0;
 }
 
@@ -1066,8 +1125,14 @@ static int vd_open(VideoDecoder *d, const char *path,
 static int vd_decode_into_pool(VideoDecoder *d) {
     if (!d) return -1;
 
+    /* Backpressure before avcodec_receive_frame. The old order received and
+     * permanently discarded a decoded frame when all eight pool slots were
+     * leased by Java, producing progressively larger presentation PTS gaps. */
+    if (!pool_has_free(d)) return -1;
+
     int drain_started = 0;
 
+decode_next:
     for (;;) {
         /* 1. Always drain buffered frames first */
         int recv_ret = avcodec_receive_frame(d->codec_ctx, d->decoded_frame);
@@ -1170,26 +1235,21 @@ produce:
         int zero_copy_interop = ap_can_zero_copy_interop(d, gpu_backend_tag, d->decoded_frame);
         AVFrame *f = d->decoded_frame;
         AVFrame *sw_frame = NULL;
-        if (d->hw_active && d->decoded_frame->format == d->hw_pix_fmt && !zero_copy_interop) {
-            sw_frame = av_frame_alloc();
-            if (!sw_frame) return -1;
-            int tr = av_hwframe_transfer_data(sw_frame, d->decoded_frame, 0);
-            if (tr < 0) {
-                av_frame_free(&sw_frame);
-                return -1;
-            }
-            sw_frame->pts = d->decoded_frame->pts;
-            sw_frame->best_effort_timestamp = d->decoded_frame->best_effort_timestamp;
-            sw_frame->duration = d->decoded_frame->duration;
-            sw_frame->colorspace = d->decoded_frame->colorspace;
-            sw_frame->color_trc = d->decoded_frame->color_trc;
-            sw_frame->color_primaries = d->decoded_frame->color_primaries;
-            sw_frame->color_range = d->decoded_frame->color_range;
-            f = sw_frame;
-        }
 
         int64_t pts_ms = resolve_pts(f, d->time_base, &d->fallback_pts_ms);
         int dur_ms     = resolve_dur(f, d->time_base, d->default_duration_ms);
+
+        /* Accurate seek preroll: decode every reference frame after the
+           backward keyframe seek, but do not allocate a pool slot, run the
+           VideoProcessor, or expose frames wholly before the requested time. */
+        if (d->seek_preroll_target_ms >= 0) {
+            int64_t frame_end_ms = pts_ms + (int64_t)(dur_ms > 0 ? dur_ms : 1);
+            if (frame_end_ms <= d->seek_preroll_target_ms) {
+                av_frame_unref(d->decoded_frame);
+                goto decode_next;
+            }
+            d->seek_preroll_target_ms = -1;
+        }
 
         if (d->min_frame_interval_ms > 0 &&
             d->last_emitted_pts_ms != INT64_MIN &&
@@ -1217,8 +1277,12 @@ produce:
             int interop_h = 0;
             int cvt = ap_d3d11_convert_to_rgba_interop(d, vf, d->decoded_frame, &interop_handle, &interop_w, &interop_h);
             if (cvt == 0 && interop_handle != 0) {
-                vf->width = d->decoded_frame->width > 0 ? d->decoded_frame->width : d->out_width;
-                vf->height = d->decoded_frame->height > 0 ? d->decoded_frame->height : d->out_height;
+                if (av_frame_ref(vf->gpu_frame_ref, d->decoded_frame) < 0) {
+                    pool_push(d, idx);
+                    return -1;
+                }
+                vf->width = interop_w;
+                vf->height = interop_h;
                 vf->pts_ms = pts_ms;
                 vf->duration_ms = dur_ms;
                 vf->pixel_format_tag = AP_FRAME_FMT_RGBA16F;
@@ -1247,6 +1311,31 @@ produce:
             }
         }
 #endif
+
+        /* GPU conversion is attempted before any staging download. Only a
+           capability or conversion failure falls back to the CPU frame path. */
+        if (d->hw_active && d->decoded_frame->format == d->hw_pix_fmt
+                && !zero_copy_interop && !sw_frame) {
+            sw_frame = av_frame_alloc();
+            if (!sw_frame) {
+                pool_push(d, idx);
+                return -1;
+            }
+            int tr = av_hwframe_transfer_data(sw_frame, d->decoded_frame, 0);
+            if (tr < 0) {
+                av_frame_free(&sw_frame);
+                pool_push(d, idx);
+                return -1;
+            }
+            sw_frame->pts = d->decoded_frame->pts;
+            sw_frame->best_effort_timestamp = d->decoded_frame->best_effort_timestamp;
+            sw_frame->duration = d->decoded_frame->duration;
+            sw_frame->colorspace = d->decoded_frame->colorspace;
+            sw_frame->color_trc = d->decoded_frame->color_trc;
+            sw_frame->color_primaries = d->decoded_frame->color_primaries;
+            sw_frame->color_range = d->decoded_frame->color_range;
+            f = sw_frame;
+        }
 
         if (zero_copy_interop) {
             enum AVPixelFormat sw_fmt = ap_hw_sw_pix_fmt_from_frame(d->decoded_frame);
@@ -1507,13 +1596,14 @@ static void vd_rewind(VideoDecoder *d) {
     d->eof = 0;
     d->fallback_pts_ms = 0;
     d->last_emitted_pts_ms = INT64_MIN;
+    d->seek_preroll_target_ms = -1;
     av_seek_frame(d->fmt_ctx, d->stream_index, 0, AVSEEK_FLAG_BACKWARD);
     avcodec_flush_buffers(d->codec_ctx);
 }
 
 static int vd_seek_ms(VideoDecoder *d, int64_t target_ms) {
     if (!d || !d->fmt_ctx || !d->codec_ctx) return AVERROR(EINVAL);
-    if (target_ms < 0) target_ms = 0;
+    target_ms = clamp_seek_target_ms(d->fmt_ctx, d->stream_index, target_ms);
     int64_t ts = av_rescale_q(target_ms, (AVRational){1, 1000}, d->time_base);
     int ret = av_seek_frame(d->fmt_ctx, d->stream_index, ts, AVSEEK_FLAG_BACKWARD);
     if (ret < 0) {
@@ -1525,6 +1615,7 @@ static int vd_seek_ms(VideoDecoder *d, int64_t target_ms) {
     d->eof = 0;
     d->fallback_pts_ms = target_ms;
     d->last_emitted_pts_ms = INT64_MIN;
+    d->seek_preroll_target_ms = target_ms;
     return 0;
 }
 
@@ -1534,6 +1625,7 @@ static int vd_seek_ms(VideoDecoder *d, int64_t target_ms) {
 
 typedef struct {
     AVFormatContext   *fmt_ctx;
+    AmCustomInput      input;
     AVCodecContext    *codec_ctx;
     int                stream_index;
 
@@ -1550,17 +1642,83 @@ typedef struct {
     int                out_buffer_capacity;
     int                pending_bytes;
     int                pending_pos;
+    int64_t            seek_preroll_target_ms;
+    uint64_t           handle;
+    volatile int       api_refs;
+    volatile int       api_lock;
 } AudioDecoder;
+
+/* Audio handles are monotonic IDs, so a stale close cannot free a new
+ * decoder whose allocator happens to reuse the same address. */
+static AudioDecoder *g_active_audio_decoders[MAX_ACTIVE_DECODERS];
+static int g_active_audio_decoder_count;
+static uint64_t g_next_audio_handle;
+static volatile int g_audio_registry_lock;
+
+static int audio_registry_add(AudioDecoder *d) {
+    int added = 0;
+    spin_lock(&g_audio_registry_lock);
+    if (g_active_audio_decoder_count < MAX_ACTIVE_DECODERS
+            && g_next_audio_handle != UINT64_MAX) {
+        d->handle = ++g_next_audio_handle;
+        g_active_audio_decoders[g_active_audio_decoder_count++] = d;
+        added = 1;
+    }
+    spin_unlock(&g_audio_registry_lock);
+    return added;
+}
+
+static AudioDecoder *audio_registry_acquire(uint64_t handle) {
+    AudioDecoder *d = NULL;
+    spin_lock(&g_audio_registry_lock);
+    for (int i = 0; i < g_active_audio_decoder_count; i++) {
+        if (g_active_audio_decoders[i]->handle == handle) {
+            d = g_active_audio_decoders[i];
+            __sync_add_and_fetch(&d->api_refs, 1);
+            break;
+        }
+    }
+    spin_unlock(&g_audio_registry_lock);
+    if (d) {
+        /* Reads may wait for network IO. Sleep while serializing callers. */
+        while (__sync_lock_test_and_set(&d->api_lock, 1)) av_usleep(1000);
+    }
+    return d;
+}
+
+static void audio_registry_release(AudioDecoder *d) {
+    spin_unlock(&d->api_lock);
+    __sync_sub_and_fetch(&d->api_refs, 1);
+}
+
+static AudioDecoder *audio_registry_remove(uint64_t handle) {
+    AudioDecoder *d = NULL;
+    spin_lock(&g_audio_registry_lock);
+    for (int i = 0; i < g_active_audio_decoder_count; i++) {
+        if (g_active_audio_decoders[i]->handle == handle) {
+            d = g_active_audio_decoders[i];
+            g_active_audio_decoders[i] = g_active_audio_decoders[--g_active_audio_decoder_count];
+            g_active_audio_decoders[g_active_audio_decoder_count] = NULL;
+            break;
+        }
+    }
+    spin_unlock(&g_audio_registry_lock);
+    return d;
+}
 
 static AudioDecoder *ad_alloc(void) {
     AudioDecoder *d = (AudioDecoder *)av_mallocz(sizeof(AudioDecoder));
-    if (d) av_channel_layout_default(&d->out_layout, AUDIO_OUT_CHANNELS);
+    if (d) {
+        av_channel_layout_default(&d->out_layout, AUDIO_OUT_CHANNELS);
+        d->seek_preroll_target_ms = -1;
+    }
     return d;
 }
 
 static void ad_free(AudioDecoder *d) {
     if (!d) return;
     if (d->fmt_ctx)    avformat_close_input(&d->fmt_ctx);
+    am_custom_close(&d->input);
     if (d->codec_ctx)  avcodec_free_context(&d->codec_ctx);
     if (d->pkt)        av_packet_free(&d->pkt);
     if (d->frame)      av_frame_free(&d->frame);
@@ -1577,7 +1735,7 @@ static int ad_open(AudioDecoder *d, const char *path,
     d->fmt_ctx = avformat_alloc_context();
     if (!d->fmt_ctx) return AVERROR(ENOMEM);
 
-    int ret = open_input(&d->fmt_ctx, path, tmo, buf_kb, recon);
+    int ret = open_input(&d->fmt_ctx, path, tmo, buf_kb, recon, &d->input);
     if (ret < 0) return ret;
 
     ret = avformat_find_stream_info(d->fmt_ctx, NULL);
@@ -1633,6 +1791,25 @@ static int ad_receive(AudioDecoder *d) {
     int in_samples = d->frame->nb_samples;
     if (in_samples <= 0) return 0;
 
+    int64_t frame_start_ms = AV_NOPTS_VALUE;
+    int64_t frame_ts = d->frame->best_effort_timestamp != AV_NOPTS_VALUE
+            ? d->frame->best_effort_timestamp : d->frame->pts;
+    if (frame_ts != AV_NOPTS_VALUE) {
+        AVStream *stream = d->fmt_ctx->streams[d->stream_index];
+        if (stream && stream->time_base.num > 0 && stream->time_base.den > 0) {
+            frame_start_ms = av_rescale_q(frame_ts, stream->time_base, (AVRational){1, 1000});
+        }
+    }
+    if (d->seek_preroll_target_ms >= 0 && frame_start_ms != AV_NOPTS_VALUE) {
+        int sample_rate = d->frame->sample_rate > 0 ? d->frame->sample_rate : d->codec_ctx->sample_rate;
+        int64_t frame_duration_ms = sample_rate > 0
+                ? av_rescale(d->frame->nb_samples, 1000, sample_rate) : 0;
+        if (frame_start_ms + frame_duration_ms <= d->seek_preroll_target_ms) {
+            av_frame_unref(d->frame);
+            return 0;
+        }
+    }
+
     int out_samples = (int)swr_get_out_samples(d->swr, in_samples);
     if (out_samples <= 0) return 0;
 
@@ -1656,9 +1833,19 @@ static int ad_receive(AudioDecoder *d) {
                                             conv, AUDIO_OUT_SAMPLE_FMT, 1);
     if (bytes <= 0) return 0;
 
-    d->pending_pos   = 0;
+    d->pending_pos = 0;
+    if (d->seek_preroll_target_ms >= 0) {
+        if (frame_start_ms != AV_NOPTS_VALUE && frame_start_ms < d->seek_preroll_target_ms) {
+            int64_t skip_ms = d->seek_preroll_target_ms - frame_start_ms;
+            int64_t skip_samples = av_rescale(skip_ms, AUDIO_OUT_SAMPLE_RATE, 1000);
+            int64_t skip_bytes = skip_samples * AUDIO_OUT_CHANNELS * av_get_bytes_per_sample(AUDIO_OUT_SAMPLE_FMT);
+            if (skip_bytes > bytes) skip_bytes = bytes;
+            d->pending_pos = (int)skip_bytes;
+        }
+        d->seek_preroll_target_ms = -1;
+    }
     d->pending_bytes = bytes;
-    return bytes;
+    return d->pending_bytes - d->pending_pos;
 }
 
 static void ad_rewind(AudioDecoder *d) {
@@ -1667,6 +1854,7 @@ static void ad_rewind(AudioDecoder *d) {
     d->drain_started = 0;
     d->pending_bytes = 0;
     d->pending_pos   = 0;
+    d->seek_preroll_target_ms = -1;
     av_seek_frame(d->fmt_ctx, d->stream_index, 0, AVSEEK_FLAG_BACKWARD);
     avcodec_flush_buffers(d->codec_ctx);
     swr_close(d->swr);
@@ -1675,7 +1863,7 @@ static void ad_rewind(AudioDecoder *d) {
 
 static int ad_seek_ms(AudioDecoder *d, int64_t target_ms) {
     if (!d || !d->fmt_ctx || !d->codec_ctx) return AVERROR(EINVAL);
-    if (target_ms < 0) target_ms = 0;
+    target_ms = clamp_seek_target_ms(d->fmt_ctx, d->stream_index, target_ms);
     AVStream *st = d->fmt_ctx->streams[d->stream_index];
     AVRational tb = (st && st->time_base.num > 0 && st->time_base.den > 0) ? st->time_base : (AVRational){1, 1000};
     int64_t ts = av_rescale_q(target_ms, (AVRational){1, 1000}, tb);
@@ -1690,6 +1878,7 @@ static int ad_seek_ms(AudioDecoder *d, int64_t target_ms) {
     d->drain_started = 0;
     d->pending_bytes = 0;
     d->pending_pos = 0;
+    d->seek_preroll_target_ms = target_ms;
     swr_close(d->swr);
     swr_init(d->swr);
     return 0;
@@ -1723,11 +1912,15 @@ const char* am_last_error()
  * Class:     cc_sighs_apricitymedia_jni_ApricityMediaNative
  * FFM API
  */
-uint64_t am_video_open(const char* jpath, int tw, int th, double max_fps, int tmo, int buf_kb, int recon, int hw_enabled, int hw_nvdec_enabled, const char* jhw_preferred)
+static uint64_t am_video_open_internal(const char* jpath, int tw, int th, double max_fps, int tmo, int buf_kb, int recon, int hw_enabled, int hw_nvdec_enabled, const char* jhw_preferred, void *opaque, am_io_read_callback read, am_io_seek_callback seek, am_io_release_callback release)
 {
     clear_last_error();
     const char *path = jpath;
-    if (!path) return 0;
+    if (!path) {
+        set_last_error_from_code("videoOpen", "", AVERROR(EINVAL));
+        if (release) release(opaque);
+        return 0;
+    }
     const char *hw_preferred = NULL;
     if (jhw_preferred) {
         hw_preferred = jhw_preferred;
@@ -1735,27 +1928,51 @@ uint64_t am_video_open(const char* jpath, int tw, int th, double max_fps, int tm
 
     VideoDecoder *d = vd_alloc();
     if (!d) {
-        if (hw_preferred) 
-        
+        set_last_error_from_code("videoOpen", path, AVERROR(ENOMEM));
+        if (release) release(opaque);
         return 0;
     }
 
+    d->input = (AmCustomInput){ .opaque = opaque, .read = read, .seek = seek, .release = release };
     int ret = vd_open(d, path, (int)tw, (int)th, (double)max_fps,
                        (int)tmo, (int)buf_kb, (int)recon,
                        (int)hw_enabled, (int)hw_nvdec_enabled, hw_preferred ? hw_preferred : "auto");
     if (ret < 0) {
         set_last_error_from_code("videoOpen", path, ret);
-        if (hw_preferred) 
-        
         vd_free(d);
         return 0;
     }
-    if (hw_preferred) 
-    
     d->api_refs = 0;
     d->close_requested = 0;
-    decoder_registry_add(d);
+    if (!decoder_registry_add(d)) {
+        set_last_error_from_code("videoOpen registry full", path, AVERROR(ENOSPC));
+        vd_free(d);
+        return 0;
+    }
     return (int64_t)(intptr_t)d;
+}
+
+uint64_t am_video_open(const char *path, int tw, int th, double fps, int tmo, int buffer, int reconnect, int hw, int nvdec, const char *preferred) {
+    return am_video_open_internal(path, tw, th, fps, tmo, buffer, reconnect, hw, nvdec, preferred, NULL, NULL, NULL, NULL);
+}
+
+uint64_t am_video_open_io(const char *name, int tw, int th, double fps, int tmo, int buffer, int reconnect, int hw, int nvdec, const char *preferred,
+                          void *opaque, am_io_read_callback read, am_io_seek_callback seek, am_io_release_callback release) {
+    if (!read || !seek) {
+        set_last_error_from_code("videoOpen custom IO", name, AVERROR(EINVAL));
+        if (release) release(opaque);
+        return 0;
+    }
+    return am_video_open_internal(name, tw, th, fps, tmo, buffer, reconnect, hw, nvdec, preferred, opaque, read, seek, release);
+}
+
+uint64_t am_video_open_region(const char *name, int tw, int th, double fps, int tmo, int buffer, int reconnect, int hw, int nvdec,
+        const char *preferred, const char *archive, int64_t offset, int64_t compressed, int64_t length, int method) {
+    int error;
+    AmArchiveCursor *cursor = am_archive_open(archive, offset, compressed, length, method, &error);
+    if (!cursor) { set_last_error_from_code("videoOpen archive region", archive, error); return 0; }
+    return am_video_open_io(name, tw, th, fps, tmo, buffer, reconnect, hw, nvdec, preferred,
+                           cursor, am_archive_read, am_archive_seek, am_archive_release);
 }
 
 /*
@@ -1781,6 +1998,106 @@ uint64_t am_video_read_frame(uint64_t decoder)
     int64_t out = (int64_t)(((uintptr_t)d << 16) | (uint16_t)idx);
     decoder_registry_release(d);
     return out;
+}
+
+/* Source leases hold only an AVFrame reference. Presentation leases own a
+   separate pool slot and texture, so replacing either cannot mutate the other. */
+uint64_t am_video_frame_retain_source(uint64_t frame)
+{
+    VideoDecoder *d = decoder_registry_acquire((uintptr_t)frame >> 16);
+    VideoFrame *source = vd_get_frame(d, (int)(frame & 0xffff));
+    if (!d || !source || !source->gpu_frame_ref || !source->gpu_frame_ref->data[0]) {
+        decoder_registry_release(d);
+        return 0;
+    }
+    int idx = pool_pop(d);
+    if (idx < 0) { decoder_registry_release(d); return 0; }
+    VideoFrame *vf = &d->pool[idx];
+    if (av_frame_ref(vf->gpu_frame_ref, source->gpu_frame_ref) < 0) {
+        pool_push(d, idx);
+        decoder_registry_release(d);
+        return 0;
+    }
+    vf->pts_ms = source->pts_ms;
+    vf->duration_ms = source->duration_ms;
+    uint64_t result = ((uintptr_t)d << 16) | (uint16_t)idx;
+    decoder_registry_release(d);
+    return result;
+}
+
+uint64_t am_video_frame_create_presentation(uint64_t source_frame, int width, int height, uint64_t generation)
+{
+    clear_last_error();
+#if defined(_WIN32)
+    VideoDecoder *d = decoder_registry_acquire((uintptr_t)source_frame >> 16);
+    VideoFrame *source = vd_get_frame(d, (int)(source_frame & 0xffff));
+    if (!d || !source || !source->gpu_frame_ref || !source->gpu_frame_ref->data[0]) {
+        set_last_error_from_code("recreatePresentation source", "", AVERROR(EINVAL));
+        decoder_registry_release(d);
+        return 0;
+    }
+    int idx = pool_pop(d);
+    if (idx < 0) {
+        set_last_error_from_code("recreatePresentation pool", "", AVERROR(EAGAIN));
+        decoder_registry_release(d); return 0;
+    }
+    VideoFrame *vf = &d->pool[idx];
+    am_video_set_presentation_size((uint64_t)(uintptr_t)d, width, height, generation);
+    int64_t handle = 0;
+    int out_w = 0, out_h = 0;
+    int ret = ap_d3d11_convert_to_rgba_interop(d, vf, source->gpu_frame_ref, &handle, &out_w, &out_h);
+    if (ret < 0 || av_frame_ref(vf->gpu_frame_ref, source->gpu_frame_ref) < 0) {
+        set_last_error_from_code("recreatePresentation GPU", "", ret < 0 ? ret : AVERROR(ENOMEM));
+        pool_push(d, idx);
+        decoder_registry_release(d);
+        return 0;
+    }
+    AVFrame *original = source->gpu_frame_ref;
+    vf->width = out_w; vf->height = out_h;
+    vf->pts_ms = source->pts_ms; vf->duration_ms = source->duration_ms;
+    vf->pixel_format_tag = AP_FRAME_FMT_RGBA16F; vf->plane_count = 0;
+    vf->color_space = original->colorspace; vf->color_trc = original->color_trc;
+    vf->color_primaries = original->color_primaries; vf->color_range = original->color_range;
+    vf->source_pix_fmt = ap_hw_sw_pix_fmt_from_frame(original);
+    vf->gpu_is_frame = 1; vf->gpu_backend_tag = 1;
+    vf->gpu_handle = handle; vf->gpu_device_handle = d->hw_device_handle;
+    vf->gpu_subresource = 0; vf->gpu_surface_width = out_w; vf->gpu_surface_height = out_h;
+    uint64_t result = ((uintptr_t)d << 16) | (uint16_t)idx;
+    decoder_registry_release(d);
+    return result;
+#else
+    (void)source_frame; (void)width; (void)height; (void)generation;
+    set_last_error_from_code("recreatePresentation backend", "", AVERROR(ENOSYS));
+    return 0;
+#endif
+}
+
+int am_video_frame_get_presentation_info(uint64_t frame, int64_t out[3])
+{
+    VideoDecoder *d = decoder_registry_acquire((uintptr_t)frame >> 16);
+    VideoFrame *vf = vd_get_frame(d, (int)(frame & 0xffff));
+    if (!d || !vf || !out) { decoder_registry_release(d); return 0; }
+    out[0] = (int64_t)vf->presentation_generation;
+    out[1] = vf->gpu_frame_ref ? vf->gpu_frame_ref->width : vf->width;
+    out[2] = vf->gpu_frame_ref ? vf->gpu_frame_ref->height : vf->height;
+    decoder_registry_release(d);
+    return 1;
+}
+
+int am_video_set_presentation_size(uint64_t decoder, int physical_width,
+                                   int physical_height, uint64_t demand_generation)
+{
+    VideoDecoder *d = decoder_registry_acquire((uintptr_t)(intptr_t)decoder);
+    if (!d) return 0;
+    physical_width = physical_width > 0 ? physical_width : 0;
+    physical_height = physical_height > 0 ? physical_height : 0;
+    spin_lock(&d->presentation_lock);
+    d->presentation_width = physical_width;
+    d->presentation_height = physical_height;
+    d->presentation_generation = demand_generation;
+    spin_unlock(&d->presentation_lock);
+    decoder_registry_release(d);
+    return 1;
 }
 
 /*
@@ -2126,7 +2443,16 @@ int64_t am_video_get_duration_ms(uint64_t decoder)
         decoder_registry_release(d);
         return -1;
     }
-    int64_t dur = d->fmt_ctx->duration;
+    int64_t dur = AV_NOPTS_VALUE;
+    AVStream *stream = d->stream_index >= 0 && d->stream_index < (int)d->fmt_ctx->nb_streams
+            ? d->fmt_ctx->streams[d->stream_index] : NULL;
+    if (stream && stream->duration > 0 && stream->duration != AV_NOPTS_VALUE
+            && stream->time_base.num > 0 && stream->time_base.den > 0) {
+        int64_t out = av_rescale_q(stream->duration, stream->time_base, (AVRational){1, 1000});
+        decoder_registry_release(d);
+        return out > 0 ? out : -1;
+    }
+    dur = d->fmt_ctx->duration;
     if (dur <= 0 || dur == AV_NOPTS_VALUE) {
         decoder_registry_release(d);
         return -1;
@@ -2227,15 +2553,24 @@ void am_video_close(uint64_t decoder)
  * Class:     cc_sighs_apricitymedia_jni_ApricityMediaNative
  * FFM API
  */
-uint64_t am_audio_open(const char* jpath, int tmo, int buf_kb, int recon)
+static uint64_t am_audio_open_internal(const char* jpath, int tmo, int buf_kb, int recon, void *opaque, am_io_read_callback read, am_io_seek_callback seek, am_io_release_callback release)
 {
     clear_last_error();
     const char *path = jpath;
-    if (!path) return 0;
+    if (!path) {
+        set_last_error_from_code("audioOpen", "", AVERROR(EINVAL));
+        if (release) release(opaque);
+        return 0;
+    }
 
     AudioDecoder *d = ad_alloc();
-    if (!d) {  return 0; }
+    if (!d) {
+        set_last_error_from_code("audioOpen", path, AVERROR(ENOMEM));
+        if (release) release(opaque);
+        return 0;
+    }
 
+    d->input = (AmCustomInput){ .opaque = opaque, .read = read, .seek = seek, .release = release };
     int ret = ad_open(d, path, (int)tmo, (int)buf_kb, (int)recon);
     if (ret < 0) {
         set_last_error_from_code("audioOpen", path, ret);
@@ -2244,17 +2579,43 @@ uint64_t am_audio_open(const char* jpath, int tmo, int buf_kb, int recon)
         return 0;
     }
     
-    return (int64_t)(intptr_t)d;
+    if (!audio_registry_add(d)) {
+        set_last_error_from_code("audioOpen registry full", path, AVERROR(ENOSPC));
+        ad_free(d);
+        return 0;
+    }
+    return d->handle;
+}
+
+uint64_t am_audio_open(const char *path, int tmo, int buffer, int reconnect) {
+    return am_audio_open_internal(path, tmo, buffer, reconnect, NULL, NULL, NULL, NULL);
+}
+
+uint64_t am_audio_open_io(const char *name, int tmo, int buffer, int reconnect,
+                          void *opaque, am_io_read_callback read, am_io_seek_callback seek, am_io_release_callback release) {
+    if (!read || !seek) {
+        set_last_error_from_code("audioOpen custom IO", name, AVERROR(EINVAL));
+        if (release) release(opaque);
+        return 0;
+    }
+    return am_audio_open_internal(name, tmo, buffer, reconnect, opaque, read, seek, release);
+}
+
+uint64_t am_audio_open_region(const char *name, int tmo, int buffer, int reconnect,
+        const char *archive, int64_t offset, int64_t compressed, int64_t length, int method) {
+    int error;
+    AmArchiveCursor *cursor = am_archive_open(archive, offset, compressed, length, method, &error);
+    if (!cursor) { set_last_error_from_code("audioOpen archive region", archive, error); return 0; }
+    return am_audio_open_io(name, tmo, buffer, reconnect, cursor, am_archive_read, am_archive_seek, am_archive_release);
 }
 
 /*
  * Class:     cc_sighs_apricitymedia_jni_ApricityMediaNative
  * FFM API
  */
-int am_audio_read_pcm(uint64_t decoder, uint8_t* jbuf, int offset, int length)
+static int ad_read_pcm(AudioDecoder *d, uint8_t* jbuf, int offset, int length)
 {
-    AudioDecoder *d = (AudioDecoder *)(intptr_t)decoder;
-    if (!d || !jbuf || length <= 0) return -2;
+    if (!d || !jbuf || offset < 0 || length <= 0 || offset > INT_MAX - length) return -2;
     int max_copy = length;
     /* Serve from pending */
     if (d->pending_bytes > d->pending_pos) {
@@ -2352,6 +2713,16 @@ int am_audio_read_pcm(uint64_t decoder, uint8_t* jbuf, int offset, int length)
  * Class:     cc_sighs_apricitymedia_jni_ApricityMediaNative
  * FFM API
  */
+int am_audio_read_pcm(uint64_t decoder, uint8_t* buffer, int offset, int length)
+{
+    if (!buffer || offset < 0 || length <= 0 || offset > INT_MAX - length) return -2;
+    AudioDecoder *d = audio_registry_acquire(decoder);
+    if (!d) return -2;
+    int result = ad_read_pcm(d, buffer, offset, length);
+    audio_registry_release(d);
+    return result;
+}
+
 int am_audio_sample_rate(uint64_t decoder)
 {
     (void)decoder;
@@ -2374,7 +2745,10 @@ int am_audio_channels(uint64_t decoder)
  */
 void am_audio_rewind(uint64_t decoder)
 {
-    ad_rewind((AudioDecoder *)(intptr_t)decoder);
+    AudioDecoder *d = audio_registry_acquire(decoder);
+    if (!d) return;
+    ad_rewind(d);
+    audio_registry_release(d);
 }
 
 /*
@@ -2383,9 +2757,10 @@ void am_audio_rewind(uint64_t decoder)
  */
 int am_audio_seek_ms(uint64_t decoder, int64_t target_ms)
 {
-    AudioDecoder *d = (AudioDecoder *)(intptr_t)decoder;
+    AudioDecoder *d = audio_registry_acquire(decoder);
     if (!d) return 0;
     int ret = ad_seek_ms(d, (int64_t)target_ms);
+    audio_registry_release(d);
     return ret >= 0 ? 1 : 0;
 }
 
@@ -2395,9 +2770,20 @@ int am_audio_seek_ms(uint64_t decoder, int64_t target_ms)
  */
 int64_t am_audio_get_duration_ms(uint64_t decoder)
 {
-    AudioDecoder *d = (AudioDecoder *)(intptr_t)decoder;
-    if (!d || !d->fmt_ctx) return -1;
-    int64_t dur = d->fmt_ctx->duration;
+    AudioDecoder *d = audio_registry_acquire(decoder);
+    if (!d) return -1;
+    int64_t dur = AV_NOPTS_VALUE;
+    AVStream *stream = d->fmt_ctx && d->stream_index >= 0
+            && d->stream_index < (int)d->fmt_ctx->nb_streams
+            ? d->fmt_ctx->streams[d->stream_index] : NULL;
+    if (stream && stream->duration > 0 && stream->duration != AV_NOPTS_VALUE
+            && stream->time_base.num > 0 && stream->time_base.den > 0) {
+        int64_t out = av_rescale_q(stream->duration, stream->time_base, (AVRational){1, 1000});
+        audio_registry_release(d);
+        return out > 0 ? out : -1;
+    }
+    dur = d->fmt_ctx ? d->fmt_ctx->duration : AV_NOPTS_VALUE;
+    audio_registry_release(d);
     if (dur <= 0 || dur == AV_NOPTS_VALUE) return -1;
     return (int64_t)(dur / 1000);
 }
@@ -2408,7 +2794,10 @@ int64_t am_audio_get_duration_ms(uint64_t decoder)
  */
 void am_audio_close(uint64_t decoder)
 {
-    ad_free((AudioDecoder *)(intptr_t)decoder);
+    AudioDecoder *d = audio_registry_remove(decoder);
+    if (!d) return;
+    while (__sync_add_and_fetch(&d->api_refs, 0) > 0) av_usleep(1000);
+    ad_free(d);
 }
 
 #if defined(_WIN32)
@@ -2418,9 +2807,17 @@ static void ap_release_d3d11_video_processor(VideoDecoder *d) {
         d->d3d11_vp->lpVtbl->Release(d->d3d11_vp);
         d->d3d11_vp = NULL;
     }
+    if (d->d3d11_vp_enum1) {
+        d->d3d11_vp_enum1->lpVtbl->Release(d->d3d11_vp_enum1);
+        d->d3d11_vp_enum1 = NULL;
+    }
     if (d->d3d11_vp_enum) {
         d->d3d11_vp_enum->lpVtbl->Release(d->d3d11_vp_enum);
         d->d3d11_vp_enum = NULL;
+    }
+    if (d->d3d11_video_context1) {
+        d->d3d11_video_context1->lpVtbl->Release(d->d3d11_video_context1);
+        d->d3d11_video_context1 = NULL;
     }
     if (d->d3d11_video_context) {
         d->d3d11_video_context->lpVtbl->Release(d->d3d11_video_context);
@@ -2432,12 +2829,15 @@ static void ap_release_d3d11_video_processor(VideoDecoder *d) {
     }
     d->d3d11_vp_in_w = 0;
     d->d3d11_vp_in_h = 0;
+    d->d3d11_vp_out_w = 0;
+    d->d3d11_vp_out_h = 0;
     d->d3d11_vp_in_fmt = DXGI_FORMAT_UNKNOWN;
     d->d3d11_vp_colorspace_logged = 0;
 }
 
-static int ap_ensure_d3d11_video_processor(VideoDecoder *d, ID3D11Texture2D *src_tex, UINT src_w, UINT src_h) {
-    if (!d || !src_tex || src_w == 0 || src_h == 0) return AVERROR(EINVAL);
+static int ap_ensure_d3d11_video_processor(VideoDecoder *d, ID3D11Texture2D *src_tex,
+                                           UINT src_w, UINT src_h, UINT out_w, UINT out_h) {
+    if (!d || !src_tex || src_w == 0 || src_h == 0 || out_w == 0 || out_h == 0) return AVERROR(EINVAL);
     if (!d->d3d11_video_device || !d->d3d11_video_context) {
         if (!d->hw_device_ctx || !d->hw_device_ctx->data) return AVERROR(EINVAL);
         AVHWDeviceContext *hwdev = (AVHWDeviceContext *)d->hw_device_ctx->data;
@@ -2448,6 +2848,9 @@ static int ap_ensure_d3d11_video_processor(VideoDecoder *d, ID3D11Texture2D *src
         d->d3d11_video_context = d3d11->video_context;
         d->d3d11_video_device->lpVtbl->AddRef(d->d3d11_video_device);
         d->d3d11_video_context->lpVtbl->AddRef(d->d3d11_video_context);
+        d->d3d11_video_context->lpVtbl->QueryInterface(
+                d->d3d11_video_context, &IID_ID3D11VideoContext1,
+                (void **)&d->d3d11_video_context1);
     }
 
     D3D11_TEXTURE2D_DESC src_desc;
@@ -2457,6 +2860,8 @@ static int ap_ensure_d3d11_video_processor(VideoDecoder *d, ID3D11Texture2D *src
     if (d->d3d11_vp && d->d3d11_vp_enum &&
         d->d3d11_vp_in_w == src_w &&
         d->d3d11_vp_in_h == src_h &&
+        d->d3d11_vp_out_w == out_w &&
+        d->d3d11_vp_out_h == out_h &&
         d->d3d11_vp_in_fmt == src_desc.Format) {
         return 0;
     }
@@ -2464,6 +2869,20 @@ static int ap_ensure_d3d11_video_processor(VideoDecoder *d, ID3D11Texture2D *src
     if (d->d3d11_vp) {
         d->d3d11_vp->lpVtbl->Release(d->d3d11_vp);
         d->d3d11_vp = NULL;
+    }
+    /* Output views are created against an enumerator. They must not survive a
+       source-format or presentation-size enumerator replacement even when the
+       backing RGBA texture happens to keep the same dimensions. */
+    for (int i = 0; i < d->pool_size; i++) {
+        VideoFrame *vf = &d->pool[i];
+        if (vf->gpu_interop_output_view) {
+            vf->gpu_interop_output_view->lpVtbl->Release(vf->gpu_interop_output_view);
+            vf->gpu_interop_output_view = NULL;
+        }
+    }
+    if (d->d3d11_vp_enum1) {
+        d->d3d11_vp_enum1->lpVtbl->Release(d->d3d11_vp_enum1);
+        d->d3d11_vp_enum1 = NULL;
     }
     if (d->d3d11_vp_enum) {
         d->d3d11_vp_enum->lpVtbl->Release(d->d3d11_vp_enum);
@@ -2475,13 +2894,16 @@ static int ap_ensure_d3d11_video_processor(VideoDecoder *d, ID3D11Texture2D *src
     content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
     content.InputWidth = src_w;
     content.InputHeight = src_h;
-    content.OutputWidth = src_w;
-    content.OutputHeight = src_h;
+    content.OutputWidth = out_w;
+    content.OutputHeight = out_h;
     content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
 
     HRESULT hr = d->d3d11_video_device->lpVtbl->CreateVideoProcessorEnumerator(
             d->d3d11_video_device, &content, &d->d3d11_vp_enum);
     if (FAILED(hr) || !d->d3d11_vp_enum) return AVERROR_EXTERNAL;
+    d->d3d11_vp_enum->lpVtbl->QueryInterface(
+            d->d3d11_vp_enum, &IID_ID3D11VideoProcessorEnumerator1,
+            (void **)&d->d3d11_vp_enum1);
 
     hr = d->d3d11_video_device->lpVtbl->CreateVideoProcessor(
             d->d3d11_video_device, d->d3d11_vp_enum, 0, &d->d3d11_vp);
@@ -2489,6 +2911,8 @@ static int ap_ensure_d3d11_video_processor(VideoDecoder *d, ID3D11Texture2D *src
 
     d->d3d11_vp_in_w = src_w;
     d->d3d11_vp_in_h = src_h;
+    d->d3d11_vp_out_w = out_w;
+    d->d3d11_vp_out_h = out_h;
     d->d3d11_vp_in_fmt = src_desc.Format;
     return 0;
 }
@@ -2549,6 +2973,97 @@ static int ap_ensure_interop_output_slot(VideoDecoder *d, VideoFrame *vf, UINT o
     return 0;
 }
 
+static AVD3D11VADeviceContext *ap_d3d11_hwctx(VideoDecoder *d) {
+    if (!d || !d->hw_device_ctx || !d->hw_device_ctx->data) return NULL;
+    AVHWDeviceContext *hwdev = (AVHWDeviceContext *)d->hw_device_ctx->data;
+    if (!hwdev || hwdev->type != AV_HWDEVICE_TYPE_D3D11VA || !hwdev->hwctx) return NULL;
+    return (AVD3D11VADeviceContext *)hwdev->hwctx;
+}
+
+static void ap_presentation_size(VideoDecoder *d, UINT visible_w, UINT visible_h,
+                                 UINT *out_w, UINT *out_h) {
+    int requested_w, requested_h;
+    spin_lock(&d->presentation_lock);
+    requested_w = d->presentation_width;
+    requested_h = d->presentation_height;
+    spin_unlock(&d->presentation_lock);
+    if (requested_w <= 0 || requested_h <= 0) {
+        *out_w = visible_w;
+        *out_h = visible_h;
+        return;
+    }
+    double scale_w = (double)requested_w / (double)visible_w;
+    double scale_h = (double)requested_h / (double)visible_h;
+    double scale = fmin(1.0, fmin(scale_w, scale_h));
+    UINT width = (UINT)fmax(2.0, floor((double)visible_w * scale + 0.5));
+    UINT height = (UINT)fmax(2.0, floor((double)visible_h * scale + 0.5));
+    *out_w = (width + 1u) & ~1u;
+    *out_h = (height + 1u) & ~1u;
+}
+
+static int ap_d3d11_set_processor_colorspace(VideoDecoder *d, const AVFrame *frame,
+                                              DXGI_FORMAT input_format) {
+    int pq = frame->color_trc == AVCOL_TRC_SMPTE2084;
+    int hlg = frame->color_trc == AVCOL_TRC_ARIB_STD_B67;
+    int bt2020 = frame->colorspace == AVCOL_SPC_BT2020_NCL
+            || frame->colorspace == AVCOL_SPC_BT2020_CL
+            || frame->color_primaries == AVCOL_PRI_BT2020;
+    int full = frame->color_range == AVCOL_RANGE_JPEG;
+    int hd_default = frame->width >= 1280 || frame->height >= 720;
+    int resolved_matrix = frame->colorspace;
+    if (resolved_matrix == AVCOL_SPC_UNSPECIFIED || resolved_matrix == AVCOL_SPC_RESERVED) {
+        resolved_matrix = hd_default ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
+    }
+
+    if (d->d3d11_video_context1 && d->d3d11_vp_enum1) {
+        if (hlg || bt2020 && !pq) return AVERROR(ENOSYS);
+        DXGI_COLOR_SPACE_TYPE input_cs;
+        DXGI_COLOR_SPACE_TYPE output_cs;
+        if (pq) {
+            if (full) return AVERROR(ENOSYS);
+            input_cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020;
+            output_cs = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        } else if (resolved_matrix == AVCOL_SPC_BT709) {
+            input_cs = full ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709
+                            : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
+            output_cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        } else {
+            input_cs = full ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601
+                            : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601;
+            output_cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        }
+        WINBOOL supported = FALSE;
+        HRESULT check = d->d3d11_vp_enum1->lpVtbl->CheckVideoProcessorFormatConversion(
+                d->d3d11_vp_enum1, input_format, input_cs,
+                DXGI_FORMAT_R16G16B16A16_FLOAT, output_cs, &supported);
+        if (FAILED(check) || !supported) return AVERROR(ENOSYS);
+        d->d3d11_video_context1->lpVtbl->VideoProcessorSetStreamColorSpace1(
+                d->d3d11_video_context1, d->d3d11_vp, 0, input_cs);
+        d->d3d11_video_context1->lpVtbl->VideoProcessorSetOutputColorSpace1(
+                d->d3d11_video_context1, d->d3d11_vp, output_cs);
+        return 0;
+    }
+
+    if (pq || hlg || bt2020) return AVERROR(ENOSYS);
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE stream_cs;
+    memset(&stream_cs, 0, sizeof(stream_cs));
+    stream_cs.Usage = 0;
+    stream_cs.RGB_Range = 0;
+    stream_cs.YCbCr_Matrix = ap_d3d11_matrix_from_av(resolved_matrix);
+    stream_cs.YCbCr_xvYCC = 0;
+    stream_cs.Nominal_Range = ap_d3d11_nominal_range_from_av(frame->color_range);
+    d->d3d11_video_context->lpVtbl->VideoProcessorSetStreamColorSpace(
+            d->d3d11_video_context, d->d3d11_vp, 0, &stream_cs);
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE output_cs;
+    memset(&output_cs, 0, sizeof(output_cs));
+    output_cs.RGB_Range = 0;
+    output_cs.YCbCr_Matrix = stream_cs.YCbCr_Matrix;
+    output_cs.Nominal_Range = 2;
+    d->d3d11_video_context->lpVtbl->VideoProcessorSetOutputColorSpace(
+            d->d3d11_video_context, d->d3d11_vp, &output_cs);
+    return 0;
+}
+
 static int ap_d3d11_convert_to_rgba_interop(VideoDecoder *d, VideoFrame *vf, const AVFrame *decoded_frame,
                                             int64_t *out_gpu_handle, int *out_surface_w, int *out_surface_h)
 {
@@ -2563,10 +3078,19 @@ static int ap_d3d11_convert_to_rgba_interop(VideoDecoder *d, VideoFrame *vf, con
     D3D11_TEXTURE2D_DESC src_desc;
     memset(&src_desc, 0, sizeof(src_desc));
     src_tex->lpVtbl->GetDesc(src_tex, &src_desc);
-    int ret = ap_ensure_d3d11_video_processor(d, src_tex, src_desc.Width, src_desc.Height);
-    if (ret < 0) return ret;
-    ret = ap_ensure_interop_output_slot(d, vf, visible_w, visible_h);
-    if (ret < 0) return ret;
+    UINT presentation_w, presentation_h;
+    ap_presentation_size(d, visible_w, visible_h, &presentation_w, &presentation_h);
+    spin_lock(&d->presentation_lock);
+    vf->presentation_generation = d->presentation_generation;
+    spin_unlock(&d->presentation_lock);
+    AVD3D11VADeviceContext *hwctx = ap_d3d11_hwctx(d);
+    if (!hwctx || !hwctx->lock || !hwctx->unlock) return AVERROR(EINVAL);
+    hwctx->lock(hwctx->lock_ctx);
+    int ret = ap_ensure_d3d11_video_processor(
+            d, src_tex, src_desc.Width, src_desc.Height, presentation_w, presentation_h);
+    if (ret < 0) goto done;
+    ret = ap_ensure_interop_output_slot(d, vf, presentation_w, presentation_h);
+    if (ret < 0) goto done;
 
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC in_desc;
     memset(&in_desc, 0, sizeof(in_desc));
@@ -2582,44 +3106,39 @@ static int ap_d3d11_convert_to_rgba_interop(VideoDecoder *d, VideoFrame *vf, con
             d->d3d11_vp_enum,
             &in_desc,
             &in_view);
-    if (FAILED(hr) || !in_view) return AVERROR_EXTERNAL;
+    if (FAILED(hr) || !in_view) {
+        ret = AVERROR_EXTERNAL;
+        goto done;
+    }
 
     RECT src_rect = {0, 0, (LONG)visible_w, (LONG)visible_h};
-    RECT dst_rect = {0, 0, (LONG)visible_w, (LONG)visible_h};
+    RECT dst_rect = {0, 0, (LONG)presentation_w, (LONG)presentation_h};
     d->d3d11_video_context->lpVtbl->VideoProcessorSetStreamSourceRect(d->d3d11_video_context, d->d3d11_vp, 0, TRUE, &src_rect);
     d->d3d11_video_context->lpVtbl->VideoProcessorSetStreamDestRect(d->d3d11_video_context, d->d3d11_vp, 0, TRUE, &dst_rect);
     d->d3d11_video_context->lpVtbl->VideoProcessorSetOutputTargetRect(d->d3d11_video_context, d->d3d11_vp, TRUE, &dst_rect);
 
-    /* Explicitly pin VP into matrix/range CSC behavior on legacy color-space API.
-       This API has no HDR transfer metadata (PQ/HLG), so HDR tone mapping is not done here. */
-    D3D11_VIDEO_PROCESSOR_COLOR_SPACE stream_cs;
-    memset(&stream_cs, 0, sizeof(stream_cs));
-    stream_cs.Usage = 0;
-    stream_cs.RGB_Range = 0;
-    stream_cs.YCbCr_Matrix = ap_d3d11_matrix_from_av(decoded_frame->colorspace);
-    stream_cs.YCbCr_xvYCC = 0;
-    stream_cs.Nominal_Range = ap_d3d11_nominal_range_from_av(decoded_frame->color_range);
-    d->d3d11_video_context->lpVtbl->VideoProcessorSetStreamColorSpace(
-            d->d3d11_video_context, d->d3d11_vp, 0, &stream_cs);
-
-    D3D11_VIDEO_PROCESSOR_COLOR_SPACE output_cs;
-    memset(&output_cs, 0, sizeof(output_cs));
-    output_cs.Usage = 0;
-    /* D3D11 spec: RGB_Range = 0(full), 1(limited). */
-    output_cs.RGB_Range = 0;
-    output_cs.YCbCr_Matrix = stream_cs.YCbCr_Matrix;
-    output_cs.YCbCr_xvYCC = 0;
-    output_cs.Nominal_Range = 2; /* 0-255 */
-    d->d3d11_video_context->lpVtbl->VideoProcessorSetOutputColorSpace(
-            d->d3d11_video_context, d->d3d11_vp, &output_cs);
+    ret = ap_d3d11_set_processor_colorspace(d, decoded_frame, src_desc.Format);
+    if (ret < 0) {
+        in_view->lpVtbl->Release(in_view);
+        goto done;
+    }
 
     if (!d->d3d11_vp_colorspace_logged) {
         d->d3d11_vp_colorspace_logged = 1;
+        int resolved_matrix = decoded_frame->colorspace;
+        if (resolved_matrix == AVCOL_SPC_UNSPECIFIED || resolved_matrix == AVCOL_SPC_RESERVED) {
+            resolved_matrix = visible_w >= 1280 || visible_h >= 720
+                    ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
+        }
         fprintf(stderr,
-                "[ApricityMediaDiag] d3d11 vp colorspace mode=csc_only streamMatrix=%u streamRange=%u outputRange=%u outputFmt=R16G16B16A16_FLOAT inputDxgi=%d fourcc=0x%08x\n",
-                (unsigned)stream_cs.YCbCr_Matrix,
-                (unsigned)stream_cs.Nominal_Range,
-                (unsigned)output_cs.Nominal_Range,
+                "[ApricityMediaDiag] d3d11 vp colorspace mode=gamma_rgb source=%ux%u presentation=%ux%u sourceMatrix=%u resolvedMatrix=%d sourceRange=%u outputTransfer=g22 outputFmt=R16G16B16A16_FLOAT inputDxgi=%d fourcc=0x%08x\n",
+                (unsigned)visible_w,
+                (unsigned)visible_h,
+                (unsigned)presentation_w,
+                (unsigned)presentation_h,
+                (unsigned)decoded_frame->colorspace,
+                resolved_matrix,
+                (unsigned)decoded_frame->color_range,
                 (int)src_desc.Format,
                 (unsigned)in_desc.FourCC);
     }
@@ -2641,11 +3160,17 @@ static int ap_d3d11_convert_to_rgba_interop(VideoDecoder *d, VideoFrame *vf, con
             1,
             &stream);
     in_view->lpVtbl->Release(in_view);
-    if (FAILED(hr)) return AVERROR_EXTERNAL;
+    if (FAILED(hr)) {
+        ret = AVERROR_EXTERNAL;
+        goto done;
+    }
 
     *out_gpu_handle = (int64_t)(intptr_t)vf->gpu_interop_texture;
-    *out_surface_w = (int)visible_w;
-    *out_surface_h = (int)visible_h;
-    return 0;
+    *out_surface_w = (int)presentation_w;
+    *out_surface_h = (int)presentation_h;
+    ret = 0;
+done:
+    hwctx->unlock(hwctx->lock_ctx);
+    return ret;
 }
 #endif

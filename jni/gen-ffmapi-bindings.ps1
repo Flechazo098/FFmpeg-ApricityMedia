@@ -9,7 +9,7 @@
       - am_ffmpeg.h in the jni/ directory
 
     Output:
-      jextract-gen/cc/sighs/apricitymedia/jni/ffm/ — generated Java sources
+      jextract-gen/cc/sighs/apricitymedia/ffm/ — generated Java sources
 
     Usage:
       .\gen-ffmapi-bindings.ps1
@@ -19,8 +19,8 @@
 param(
     [string]$JextractHome = "",
     [string]$OutputDir = "jextract-gen",
-    [string]$HeaderFile = "jni/am_ffmpeg.h",
-    [string]$PackageName = "cc.sighs.apricitymedia.jni.ffm"
+    [string]$HeaderFile = "am_ffmpeg.h",
+    [string]$PackageName = "cc.sighs.apricitymedia.ffm"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -48,13 +48,13 @@ if (-not (Get-Command $jextract -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-$header = Join-Path $PSScriptRoot $HeaderFile
+$header = if ([System.IO.Path]::IsPathRooted($HeaderFile)) { $HeaderFile } else { Join-Path $PSScriptRoot $HeaderFile }
 if (-not (Test-Path $header)) {
     Write-Error "Header not found: $header"
     exit 1
 }
 
-$outDir = Join-Path $PSScriptRoot $OutputDir
+$outDir = if ([System.IO.Path]::IsPathRooted($OutputDir)) { $OutputDir } else { Join-Path $PSScriptRoot $OutputDir }
 $null = New-Item -ItemType Directory -Path $outDir -Force
 
 Write-Host "=== Generating FFM API bindings via jextract ===" -ForegroundColor Cyan
@@ -70,7 +70,7 @@ Write-Host "  jextract: $jextract"
     --target-package $PackageName `
     --library am_ffmpeg `
     --header-class-name AmFfmpeg `
-    -I (Join-Path $PSScriptRoot "jni") `
+    -I $PSScriptRoot `
     $header
 
 if ($LASTEXITCODE -eq 0) {

@@ -2,135 +2,97 @@ package cc.sighs.apricitymedia.jni;
 
 import java.nio.ByteBuffer;
 
-/**
- * Native JNI bridge to the minimal FFmpeg build.
- *
- * <p>This class replaces the JavaCPP-based FFmpegRuntimeBootstrap +
- * FFmpegAudioDecoder/FFmpegVideoDecoder with direct JNI calls.
- * All methods are static — the native side manages opaque handles (long).
- */
+/** JNI declarations. The runtime bootstrap loads the library before use. */
 public final class ApricityMediaNative {
-
-    static {
-        System.loadLibrary("apricitymedia-jni");
-    }
-
     private ApricityMediaNative() {}
 
-    // ---------------------------------------------------------------
-    //  Lifecycle
-    // ---------------------------------------------------------------
-
-    /** Initialize FFmpeg global state (log level, network). Call once at startup. */
     public static native void init();
 
-    // ---------------------------------------------------------------
-    //  Video
-    // ---------------------------------------------------------------
+    public static native String lastError();
 
-    /**
-     * Open a video file or stream.
-     * @return opaque decoder handle (0 on failure)
-     */
-    public static native long videoOpen(String path,
-                                        int targetWidth,
-                                        int targetHeight,
-                                        double maxFps,
-                                        int networkTimeoutMs,
-                                        int networkBufferKb,
-                                        boolean networkReconnect);
+    public static native long videoOpen(String path, int targetWidth, int targetHeight, double maxFps, int networkTimeoutMs, int networkBufferKb, boolean networkReconnect, boolean hwDecodeEnabled, boolean hwNvdecEnabled, String hwPreferred);
 
-    /**
-     * Decode the next video frame.
-     * @return opaque frame handle (0 on EOF or error)
-     */
     public static native long videoReadFrame(long decoderHandle);
 
-    /**
-     * Get decoded frame metadata.
-     * @param info  long[4] filled as [width, height, ptsMs, durationMs]
-     * @return total pixel bytes (width * height * 4), or 0 on error
-     */
+    public static native long videoFrameRetainSource(long frame);
+
+    public static native long videoFrameCreatePresentation(long source, int width, int height, long generation);
+
+    public static native int videoFrameGetPresentationInfo(long frame, long[] info);
+
+    public static native boolean videoSetPresentationSize(long decoderHandle, int physicalWidth, int physicalHeight, long generation);
+
     public static native int videoFrameGetInfo(long frameHandle, long[] info);
 
-    /**
-     * Get a direct ByteBuffer pointing to RGBA pixel data.
-     * Valid until {@link #videoFrameRelease(long)} is called.
-     */
-    public static native ByteBuffer videoFrameGetPixels(long frameHandle);
+    public static native ByteBuffer videoFrameGetPixels(long frameHandle, int width, int height);
 
-    /** Pixel format tag: 0=RGBA8888, 1=YUV420P, 2=NV12, 3=YUV420P10LE, 4=P010LE. */
     public static native int videoFrameGetPixelFormat(long frameHandle);
 
-    /** Number of valid planes for current frame. */
+    public static native boolean videoFrameIsGpuFrame(long frameHandle);
+
+    public static native int videoFrameGetGpuBackendTag(long frameHandle);
+
+    public static native long videoFrameGetGpuHandle(long frameHandle);
+
+    public static native int videoFrameGetGpuSubresource(long frameHandle);
+
+    public static native int videoFrameGetGpuSurfaceInfo(long frameHandle, int[] info);
+
     public static native int videoFrameGetPlaneCount(long frameHandle);
 
-    /**
-     * Get plane metadata.
-     * @param info int[3] filled as [rowStride, pixelStride, planeBytes]
-     * @return plane bytes, or 0 on error
-     */
     public static native int videoFrameGetPlaneInfo(long frameHandle, int planeIndex, int[] info);
 
-    /**
-     * Get a direct ByteBuffer for requested plane.
-     * Valid until {@link #videoFrameRelease(long)} is called.
-     */
-    public static native ByteBuffer videoFrameGetPlaneBuffer(long frameHandle, int planeIndex);
+    public static native ByteBuffer videoFrameGetPlaneBuffer(long frameHandle, int planeIndex, long dataSize);
 
-    /**
-     * Get color metadata.
-     * @param info int[4] filled as [colorspace, colorTrc, colorPrimaries, colorRange]
-     * @return 1 if filled, 0 on error
-     */
     public static native int videoFrameGetColorInfo(long frameHandle, int[] info);
 
-    /**
-     * Get original decoded pixel format name from FFmpeg (e.g. yuv420p10le, nv12).
-     * Returns "unknown" when unavailable.
-     */
     public static native String videoFrameGetSourcePixelFormat(long frameHandle);
 
-    /** Release a decoded frame returned by {@link #videoReadFrame(long)}. */
     public static native void videoFrameRelease(long frameHandle);
 
-    /** Rewind the video decoder to the beginning. */
     public static native void videoRewind(long decoderHandle);
 
-    /** Close the video decoder and free all native resources. */
+    public static native boolean videoSeekMs(long decoderHandle, long targetMs);
+
+    public static native long videoGetDurationMs(long decoderHandle);
+
+    public static native boolean videoIsHardwareDecode(long decoderHandle);
+
+    public static native String videoGetHardwareBackend(long decoderHandle);
+
+    public static native String videoGetHardwareProbeMessage(long decoderHandle);
+
+    public static native long videoGetHardwareDeviceHandle(long decoderHandle);
+
     public static native void videoClose(long decoderHandle);
 
-    // ---------------------------------------------------------------
-    //  Audio
-    // ---------------------------------------------------------------
+    public static native long audioOpen(String path, int networkTimeoutMs, int networkBufferKb, boolean networkReconnect);
 
-    /**
-     * Open an audio file or stream.
-     * @return opaque decoder handle (0 on failure)
-     */
-    public static native long audioOpen(String path,
-                                        int networkTimeoutMs,
-                                        int networkBufferKb,
-                                        boolean networkReconnect);
+    public static native int audioReadPcm(long decoderHandle, byte[] buffer, int offset, int length);
 
-    /**
-     * Read the next decoded PCM chunk (S16LE, 48000 Hz, stereo).
-     * @return bytes written (>0), 0 (no data yet), -1 (EOF drained), -2 (error)
-     */
-    public static native int audioReadPcm(long decoderHandle,
-                                          byte[] buffer,
-                                          int offset,
-                                          int length);
-
-    /** Get the output sample rate (always 48000). */
     public static native int audioSampleRate(long decoderHandle);
 
-    /** Get the output channel count (always 2). */
     public static native int audioChannels(long decoderHandle);
 
-    /** Rewind the audio decoder to the beginning. */
     public static native void audioRewind(long decoderHandle);
 
-    /** Close the audio decoder and free all native resources. */
+    public static native boolean audioSeekMs(long decoderHandle, long targetMs);
+
+    public static native long audioGetDurationMs(long decoderHandle);
+
     public static native void audioClose(long decoderHandle);
+
+    // Standalone header-generation declarations use Object for the callback.
+    // The shipped Java binding narrows it to core MediaInput. Both use jobject.
+    public static native long videoOpenInput(String path, int width, int height, double fps,
+            int timeout, int buffer, boolean reconnect, boolean hardware, boolean nvdec,
+            String preferred, Object input);
+    public static native long audioOpenInput(String path, int timeout, int buffer,
+            boolean reconnect, Object input);
+    public static native long videoOpenRegion(String path, int width, int height, double fps,
+            int timeout, int buffer, boolean reconnect, boolean hardware, boolean nvdec,
+            String preferred, String archive, long offset, long compressedLength, long length, int compression);
+    public static native long audioOpenRegion(String path, int timeout, int buffer, boolean reconnect,
+            String archive, long offset, long compressedLength, long length, int compression);
+    public static native long resourceIoMetric(int metric);
 }
